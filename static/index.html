@@ -11,7 +11,177 @@
 <script>(function(){var p=location.pathname.endsWith('/')?location.pathname:(location.pathname.replace(/\/[^\/]*$/,'/')||'/');document.write('<base href="'+location.origin+p+'">');})()</script>
 <script>(function(){var themes={light:1,dark:1,system:1},skins={default:1,ares:1,mono:1,slate:1,poseidon:1,sisyphus:1,charizard:1},legacy={slate:['dark','slate'],solarized:['dark','poseidon'],monokai:['dark','sisyphus'],nord:['dark','slate'],oled:['dark','default']},t=(localStorage.getItem('hermes-theme')||'dark').toLowerCase(),s=(localStorage.getItem('hermes-skin')||'').toLowerCase(),m=legacy[t],theme=m?m[0]:(themes[t]?t:'dark'),skin=skins[s]?s:(m?m[1]:'default');localStorage.setItem('hermes-theme',theme);localStorage.setItem('hermes-skin',skin);if(theme==='system')theme=window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';if(theme==='dark')document.documentElement.classList.add('dark');if(skin!=='default')document.documentElement.dataset.skin=skin;})()</script>
 <script>(function(){var fs=localStorage.getItem('hermes-font-size');if(fs&&fs!=='default')document.documentElement.dataset.fontSize=fs;})()</script>
-<script>(function(){try{document.documentElement.dataset.workspacePanel=localStorage.getItem('hermes-webui-workspace-panel')==='open'?'open':'closed';}catch(e){document.documentElement.dataset.workspacePanel='closed';}})()</script>
+<!-- ═══════════════════════════════════════════════════════════
+     语音播报 (Voice Broadcast) — 服务端 TTS + HTML5 播放
+     ═══════════════════════════════════════════════════════════ -->
+<script>
+(function() {
+  'use strict';
+
+  // 当前播放的音频对象
+  var currentAudio = null;
+  var playingBtn = null;
+
+  // 清理文本（移除 markdown 格式，用于 TTS 生成）
+  function cleanTextForTTS(text) {
+    return text
+      .replace(/\|/g, ' ')
+      .replace(/^[|\s]+$/gm, '')
+      .replace(/#{1,6}\s*/g, '')
+      .replace(/\*\*(.*?)\*\*/g, '$1')
+      .replace(/\*(.*?)\*/g, '$1')
+      .replace(/`([^`]+)`/g, '$1')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  // 在每条助手消息下添加播放按钮
+  function addVoiceButtons() {
+    var segments = document.querySelectorAll('.assistant-segment');
+    console.log('[语音播报] 找到', segments.length, '个助手消息段');
+    segments.forEach(function(seg, idx) {
+      // 检查是否已有播放按钮
+      if (seg.querySelector('.voice-play-btn')) {
+        console.log('[语音播报] 消息 #' + idx + ' 已有播放按钮，跳过');
+        return;
+      }
+
+      // 获取消息文本
+      var bodyDiv = seg.querySelector('.msg-body');
+      if (!bodyDiv) {
+        console.log('[语音播报] 消息 #' + idx + ' 没有 msg-body，跳过');
+        return;
+      }
+
+      var rawText = seg.dataset.rawText || bodyDiv.innerText || bodyDiv.textContent || '';
+      var text = cleanTextForTTS(rawText);
+
+      // 只给有内容的消息添加按钮
+      if (!text || text.length === 0) {
+        console.log('[语音播报] 消息 #' + idx + ' 无有效内容，跳过');
+        return;
+      }
+
+      // 在 msg-foot 前插入播放按钮
+      var foot = seg.querySelector('.msg-foot');
+      if (!foot) {
+        console.log('[语音播报] 消息 #' + idx + ' 没有 msg-foot，跳过');
+        return;
+      }
+
+      var btn = document.createElement('button');
+      btn.className = 'msg-action-btn voice-play-btn';
+      btn.title = '播放语音';
+      btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg>';
+      btn.onclick = function() { playMessageTTS(text, btn); };
+
+      // 插入到 msg-foot 之前
+      foot.parentNode.insertBefore(btn, foot);
+      console.log('[语音播报] 消息 #' + idx + ' 已添加播放按钮');
+    });
+  }
+
+  // 播放消息 TTS
+  function playMessageTTS(text, btn) {
+    // 如果正在播放，先停止
+    if (currentAudio) {
+      currentAudio.pause();
+      currentAudio = null;
+    }
+
+    // 如果点击的是正在播放的按钮，停止
+    if (playingBtn === btn) {
+      playingBtn = null;
+      btn.classList.remove('playing');
+      return;
+    }
+
+    // 恢复之前播放的按钮状态
+    if (playingBtn) {
+      playingBtn.classList.remove('playing');
+    }
+
+    btn.classList.add('playing');
+    playingBtn = btn;
+
+    // 调用服务端 TTS API
+    fetch('/api/tts', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text: text, voice: 'zh-CN-XiaoxiaoNeural'})
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.error) {
+        console.error('TTS 错误:', data.error);
+        btn.classList.remove('playing');
+        playingBtn = null;
+        return;
+      }
+      // 播放音频
+      currentAudio = new Audio(data.url);
+      currentAudio.onended = function() {
+        btn.classList.remove('playing');
+        playingBtn = null;
+        currentAudio = null;
+      };
+      currentAudio.onerror = function() {
+        btn.classList.remove('playing');
+        playingBtn = null;
+        currentAudio = null;
+        console.error('音频播放失败');
+      };
+      currentAudio.play();
+    })
+    .catch(function(err) {
+      console.error('TTS API 调用失败:', err);
+      btn.classList.remove('playing');
+      playingBtn = null;
+    });
+  }
+
+  // 监听 renderMessages 调用，自动添加播放按钮
+  var originalRenderMessages = window.renderMessages;
+  if (typeof originalRenderMessages === 'function') {
+    window.renderMessages = function() {
+      originalRenderMessages.apply(this, arguments);
+      setTimeout(addVoiceButtons, 30);
+    };
+  }
+
+  // 使用 MutationObserver 监听新消息的添加
+  var messagesContainer = null;
+  var observer = null;
+
+  function initObserver() {
+    messagesContainer = document.getElementById('msgInner');
+    if (!messagesContainer) return;
+
+    observer = new MutationObserver(function(mutations) {
+      var hasAssistantSegment = document.querySelector('.assistant-segment');
+      if (hasAssistantSegment) {
+        addVoiceButtons();
+      }
+    });
+
+    observer.observe(messagesContainer, {
+      childList: true,
+      subtree: true
+    });
+  }
+
+  // 初始调用
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function() {
+      initObserver();
+      addVoiceButtons();
+    });
+  } else {
+    initObserver();
+    addVoiceButtons();
+  }
+})();
+</script>
 <link rel="stylesheet" href="static/style.css">
   <!-- KaTeX math rendering CSS (loaded eagerly to prevent layout shift) -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css" integrity="sha384-5TcZemv2l/9On385z///+d7MSYlvIEw9FuZTIdZ14vJLqWphw7e7ZPuOiCHJcFCP" crossorigin="anonymous">
@@ -640,7 +810,6 @@
           </div>
         </div>
       </div>
-      </div>
     </div>
   </div>
 </div>
@@ -672,5 +841,94 @@
 <script src="static/panels.js"></script>
 <script src="static/onboarding.js"></script>
 <script src="static/boot.js"></script>
+<!-- ═══════════════════════════════════════════════════════════
+     悬浮玩偶 (Floating Mascot) — 根据 S.busy 状态切换动画
+     ═══════════════════════════════════════════════════════════ -->
+<div id="mascot" class="mascot-idle" title="Hermes 小助手">
+  <!-- 状态指示器 -->
+  <div class="mascot-status-dot idle" id="mascotStatusDot"></div>
+  
+  <!-- 拉布布图片 -->
+  <img id="mascotImg" class="mascot-img" src="static/mascot/labubu_idle.gif" alt="Labubu"/>
+</div>
+<!-- Mascot JS -->
+<script>
+// ═══════════════════════════════════════════════════════════
+// 悬浮玩偶逻辑 — 监听 S.busy 状态变化
+// ═══════════════════════════════════════════════════════════
+(function() {
+  const mascot = document.getElementById('mascot');
+  const statusDot = document.getElementById('mascotStatusDot');
+  const mascotImg = document.getElementById('mascotImg');
+  
+  // 图片路径
+  const IMG_IDLE = 'static/mascot/labubu_idle.gif';
+  const IMG_BUSY = 'static/mascot/labubu_busy.gif';
+  
+  // 更新玩偶状态
+  function updateMascotState() {
+    if (!mascot || !S) return;
+    
+    const busy = S.busy === true;
+    
+    // 切换 CSS 类
+    mascot.classList.remove('mascot-idle', 'mascot-busy');
+    mascot.classList.add(busy ? 'mascot-busy' : 'mascot-idle');
+    
+    // 切换图片
+    if (mascotImg) mascotImg.src = busy ? IMG_BUSY : IMG_IDLE;
+    
+    // 更新状态圆点
+    if (statusDot) {
+      statusDot.classList.remove('idle', 'busy');
+      statusDot.classList.add(busy ? 'busy' : 'idle');
+    }
+    
+    console.log('Mascot 状态:', busy ? '忙碌' : '空闲', '| 图片:', mascotImg.src);
+  }
+  
+  // 初始化图片
+  function initMascotImages() {
+    if (mascotImg) mascotImg.src = IMG_IDLE;
+  }
+  
+  // 监听 S.busy 变化
+  let lastBusyState = S?.busy;
+  
+  function checkStateChange() {
+    if (S?.busy !== lastBusyState) {
+      lastBusyState = S.busy;
+      updateMascotState();
+    }
+  }
+  
+  // 初始调用
+  setTimeout(function() {
+    initMascotImages();
+    updateMascotState();
+  }, 100);
+  
+  // 定期轮询 (作为兜底)
+  setInterval(checkStateChange, 500);
+  
+  // 监听关键函数的调用 — 通过 monkey-patch setBusy
+  const originalSetBusy = window.setBusy;
+  if (typeof originalSetBusy === 'function') {
+    window.setBusy = function(v) {
+      originalSetBusy(v);
+      setTimeout(updateMascotState, 10);
+    };
+  }
+  
+  // 监听工具调用变化
+  const originalRenderMessages = window.renderMessages;
+  if (typeof originalRenderMessages === 'function') {
+    window.renderMessages = function() {
+      originalRenderMessages.apply(this, arguments);
+      setTimeout(updateMascotState, 10);
+    };
+  }
+})();
+</script>
 </body>
 </html>

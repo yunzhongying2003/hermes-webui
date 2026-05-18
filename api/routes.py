@@ -896,6 +896,24 @@ def handle_get(handler, parsed) -> bool:
             {"name": get_active_profile_name(), "path": str(get_active_hermes_home())},
         )
 
+    # Serve generated TTS audio files (GET request)
+    if parsed.path.startswith("/api/audio/"):
+        filename = parsed.path[len("/api/audio/"):]
+        if not filename or not filename.endswith(".mp3"):
+            return bad(handler, "invalid audio file", 400)
+        audio_dir = Path("/root/.hermes/audio_cache")
+        filepath = audio_dir / filename
+        if not filepath.exists():
+            return bad(handler, "audio file not found", 404)
+        handler.send_response(200)
+        handler.send_header("Content-Type", "audio/mpeg")
+        handler.send_header("Content-Length", str(filepath.stat().st_size))
+        handler.send_header("Cache-Control", "public, max-age=3600")
+        handler.end_headers()
+        with open(filepath, "rb") as f:
+            handler.wfile.write(f.read())
+        return True
+
     return False  # 404
 
 
@@ -913,6 +931,38 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/transcribe":
         return handle_transcribe(handler)
+
+    # TTS: generate audio from text using edge-tts
+    if parsed.path == "/api/tts":
+        body = read_body(handler)
+        text = body.get("text", "").strip()
+        if not text:
+            return bad(handler, "text is required", 400)
+        voice = body.get("voice", "zh-CN-XiaoxiaoNeural")
+        
+        import asyncio
+        import edge_tts
+        import uuid
+        import os
+        
+        audio_dir = Path("/root/.hermes/audio_cache")
+        audio_dir.mkdir(parents=True, exist_ok=True)
+        
+        filename = f"tts_{uuid.uuid4().hex}.mp3"
+        filepath = audio_dir / filename
+        
+        async def _generate():
+            comm = edge_tts.Communicate(text, voice)
+            await comm.save(str(filepath))
+        
+        try:
+            asyncio.run(_generate())
+            if not filepath.exists():
+                return bad(handler, "audio generation failed", 500)
+            return j(handler, {"url": f"/api/audio/{filename}"})
+        except Exception as e:
+            logger.exception("TTS generation failed")
+            return bad(handler, f"TTS error: {str(e)}", 500)
 
     body = read_body(handler)
 

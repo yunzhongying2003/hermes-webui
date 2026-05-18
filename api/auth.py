@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 PUBLIC_PATHS = frozenset({
     '/login', '/health', '/favicon.ico',
     '/api/auth/login', '/api/auth/status',
+    '/api/audio/',  # TTS audio files - public access for playback
 })
 
 COOKIE_NAME = 'hermes_session'
@@ -128,6 +129,18 @@ def verify_session(cookie_value) -> bool:
     if not hmac.compare_digest(sig, expected_sig):
         return False
     expiry = _sessions.get(token)
+    if not expiry:
+        # Try loading from persistent storage
+        try:
+            import pickle as _pickle
+            _sess_file = STATE_DIR / 'sessions' / '_sessions.pkl'
+            if _sess_file.exists():
+                _loaded = _pickle.loads(_sess_file.read_bytes())
+                if token in _loaded and _loaded[token] > time.time():
+                    _sessions[token] = _loaded[token]
+                    expiry = _loaded[token]
+        except Exception:
+            pass
     if not expiry or time.time() > expiry:
         _sessions.pop(token, None)
         return False
@@ -163,6 +176,10 @@ def check_auth(handler, parsed) -> bool:
     # Public paths don't require auth
     if parsed.path in PUBLIC_PATHS or parsed.path.startswith('/static/'):
         return True
+    # Check public path prefixes (e.g., /api/audio/xxx.mp3)
+    for prefix in ['/api/audio/']:
+        if parsed.path.startswith(prefix):
+            return True
     # Check session cookie
     cookie_val = parse_cookie(handler)
     if cookie_val and verify_session(cookie_val):
