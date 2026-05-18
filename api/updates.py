@@ -1,19 +1,24 @@
 """
 Hermes Web UI -- Self-update checker.
 
-Checks if the webui and hermes-agent git repos are behind their upstream
-branches. Results are cached server-side (30-min TTL) so git fetch runs
+Checks if the webui and hermes-agent git repos are behind their latest
+release tags. Results are cached server-side (30-min TTL) so git fetch runs
 at most twice per hour regardless of client count.
 
 Skips repos that are not git checkouts (e.g. Docker baked images where
 .git does not exist).
 """
+import hashlib
+import json
+import re
 import subprocess
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
+from urllib.parse import urlparse
 
-from api.config import REPO_ROOT
+from api.config import REPO_ROOT, STREAMS, STREAMS_LOCK
 
 # Lazy -- may be None if agent not found
 try:
@@ -22,10 +27,38 @@ except ImportError:
     _AGENT_DIR = None
 
 _update_cache = {'webui': None, 'agent': None, 'checked_at': 0}
+_SUMMARY_CACHE_MAX = 16
+_summary_cache: OrderedDict = OrderedDict()
 _cache_lock = threading.Lock()
 _check_in_progress = False
 _apply_lock = threading.Lock()   # prevents concurrent stash/pull/pop on same repo
 CACHE_TTL = 1800  # 30 minutes
+
+
+def _active_stream_count() -> int:
+    """Return the current in-memory chat stream count.
+
+    Self-update schedules an in-process re-exec after git pull/reset.  That is
+    restart-equivalent for live streams, even when systemd does not see a unit
+    restart.  Refuse update/force-update while a stream exists so a browser
+    update click cannot recreate the pending-message loss class fixed in #1543.
+    """
+    with STREAMS_LOCK:
+        return len(STREAMS)
+
+
+def _restart_blocked_response(target: str, active_streams: int) -> dict:
+    plural = "s" if active_streams != 1 else ""
+    return {
+        'ok': False,
+        'message': (
+            f'Cannot update {target} while {active_streams} active chat stream{plural} '
+            'is running. Wait for the response to finish, then retry the update.'
+        ),
+        'target': target,
+        'restart_blocked': True,
+        'active_streams': active_streams,
+    }
 
 
 def _run_git(args, cwd, timeout=10):
@@ -53,6 +86,24 @@ def _run_git(args, cwd, timeout=10):
         return f'git failed to start: {exc}', False
 
 
+def _dirty_suffix(path: Path, timeout=1) -> str:
+    """Return a best-effort ``-dirty`` suffix without blocking version display."""
+    out, ok = _run_git(['diff-index', '--quiet', 'HEAD', '--'], path, timeout=timeout)
+    if ok:
+        return ""
+    # diff-index exits 1 with no output for a dirty tree. Timeouts and real git
+    # failures include a diagnostic; skip the suffix so the base version remains.
+    return "-dirty" if not out else ""
+
+
+def _describe_git_version(path: Path, *, timeout=5, dirty_timeout=1) -> str | None:
+    """Return a fast git version string for a checkout, if available."""
+    out, ok = _run_git(['describe', '--tags', '--always'], path, timeout=timeout)
+    if not (ok and out):
+        return None
+    return out + _dirty_suffix(path, timeout=dirty_timeout)
+
+
 def _detect_webui_version() -> str:
     """Detect the running WebUI version from git or a baked-in fallback file.
 
@@ -68,8 +119,8 @@ def _detect_webui_version() -> str:
     """
     # Timeout capped at 3s: git describe on a healthy local repo is <50ms;
     # a 10s stall on import (NFS-mounted .git, broken git binary) is unacceptable.
-    out, ok = _run_git(['describe', '--tags', '--always', '--dirty'], REPO_ROOT, timeout=3)
-    if ok and out:
+    out = _describe_git_version(REPO_ROOT)
+    if out:
         return out
 
     # Docker / baked-image fallback: api/_version.py written by CI at build time.
@@ -91,8 +142,66 @@ def _detect_webui_version() -> str:
     return 'unknown'
 
 
+def _detect_agent_version() -> str:
+    """Detect the running Hermes Agent version for UI display."""
+    if _AGENT_DIR is None:
+        return 'not detected'
+
+    version_file = Path(_AGENT_DIR) / "VERSION"
+    try:
+        if version_file.exists():
+            text = version_file.read_text(encoding='utf-8').strip()
+            if text:
+                return text
+    except Exception:
+        pass
+
+    # Fallback: infer from git describe when the checkout exists but no VERSION
+    # file is available (common in source checkouts and developer environments).
+    if not Path(_AGENT_DIR).exists():
+        return 'not detected'
+    # Symmetric with _detect_webui_version() above — `--dirty` flags a
+    # locally-modified checkout so operators can see when their agent has
+    # uncommitted changes vs a clean tag. Per Opus advisor on stage-293.
+    out = _describe_git_version(Path(_AGENT_DIR))
+    if out:
+        return out
+
+    return 'not detected'
+
+
 # Resolved once at import time — tags cannot change without a process restart.
 WEBUI_VERSION: str = _detect_webui_version()
+AGENT_VERSION: str = _detect_agent_version()
+
+
+def _normalize_remote_url(remote_url):
+    """Return the browser-facing repository URL for update compare links.
+
+    Git remotes may be HTTPS or SSH and may include a literal ``.git`` suffix.
+    Strip only that literal suffix — never use ``str.rstrip('.git')`` because it
+    treats the argument as a character set and can truncate ``hermes-webui`` to
+    ``hermes-webu``.
+    """
+    if not remote_url:
+        return remote_url
+    remote_url = remote_url.strip()
+    if remote_url.startswith('git@'):
+        remote_url = remote_url.replace(':', '/', 1).replace('git@', 'https://', 1)
+    remote_url = remote_url.rstrip('/')
+    if remote_url.endswith('.git'):
+        remote_url = remote_url[:-4]
+    return remote_url.rstrip('/')
+
+
+def _build_compare_url(repo_url, current_sha, latest_sha):
+    """Return a safe browser compare URL, or None when any piece is missing."""
+    if not (repo_url and current_sha and latest_sha):
+        return None
+    parsed = urlparse(repo_url)
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+        return None
+    return f"{repo_url}/compare/{current_sha}...{latest_sha}"
 
 
 def _split_remote_ref(ref):
@@ -120,15 +229,65 @@ def _detect_default_branch(path):
     return 'master'
 
 
-def _check_repo(path, name):
-    """Check if a git repo is behind its upstream. Returns dict or None."""
-    if path is None or not (path / '.git').exists():
+def _release_tags(path):
+    """Return release tags newest-first, using the repo's version-sort order."""
+    out, ok = _run_git(['tag', '--list', 'v*', '--sort=-v:refname'], path)
+    if not (ok and out):
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _current_release_tag(path):
+    """Return the latest release tag reachable from HEAD, if one exists."""
+    out, ok = _run_git(['describe', '--tags', '--abbrev=0'], path)
+    return out if ok and out else None
+
+
+def _release_gap(tags, current, latest):
+    """Count release tags between current and latest in a newest-first list."""
+    if not latest or current == latest:
+        return 0
+    if current in tags:
+        return tags.index(current)
+    return 1
+
+
+def _check_repo_release(path, name):
+    """Check if a git repo is behind its latest published release tag."""
+    tags = _release_tags(path)
+    if not tags:
         return None
 
+    latest_tag = tags[0]
+    current_tag = _current_release_tag(path)
+    behind = _release_gap(tags, current_tag, latest_tag)
+
+    remote_url, _ = _run_git(['remote', 'get-url', 'origin'], path)
+    remote_url = _normalize_remote_url(remote_url)
+
+    return {
+        'name': name,
+        'behind': behind,
+        # GitHub compare URLs accept tag names, and tag-to-tag links are the
+        # clearest "what changed in this release?" view for operators.
+        'current_sha': current_tag,
+        'latest_sha': latest_tag,
+        'branch': latest_tag,
+        'repo_url': remote_url,
+        'release_based': True,
+        'current_version': current_tag,
+        'latest_version': latest_tag,
+    }
+
+
+def _check_repo_branch(path, name, *, fetch=True):
+    """Fallback: check if a git repo is behind its upstream branch."""
+
     # Fetch latest from origin (network call, cached by TTL)
-    _, fetch_ok = _run_git(['fetch', 'origin', '--quiet'], path, timeout=15)
-    if not fetch_ok:
-        return {'name': name, 'behind': 0, 'error': 'fetch failed'}
+    if fetch:
+        _, fetch_ok = _run_git(['fetch', 'origin', '--quiet'], path, timeout=15)
+        if not fetch_ok:
+            return {'name': name, 'behind': 0, 'error': 'fetch failed'}
 
     # Use the current branch's upstream tracking branch, not the repo default.
     # This avoids false "N updates behind" alerts when the user is on a feature
@@ -146,9 +305,40 @@ def _check_repo(path, name):
     out, ok = _run_git(['rev-list', '--count', f'HEAD..{compare_ref}'], path)
     behind = int(out) if ok and out.isdigit() else 0
 
-    # Get short SHAs for display
-    current, _ = _run_git(['rev-parse', '--short', 'HEAD'], path)
+    # Get short SHAs for display.
+    #
+    # latest_sha = upstream tip (compare_ref). Always exists on github.com
+    # because it is literally the commit `git fetch` just pulled.
+    #
+    # current_sha is trickier. The intuitive choice — local HEAD — breaks
+    # the "What's new?" compare URL whenever HEAD is not a public commit:
+    # unpushed work, dirty stage branches, forks, in-flight rebases, or
+    # release-time merge commits whose SHA only lives in the maintainer's
+    # checkout. We saw exactly this in #1579: a banner reporting "17 updates"
+    # linked to /compare/<localHEAD>...<upstream> and 404'd because <localHEAD>
+    # was never pushed to the canonical repo.
+    #
+    # The right base is the merge-base between HEAD and the upstream ref —
+    # that's the most recent commit both sides agree on, and (because
+    # `git fetch` succeeded above) it is guaranteed to be present upstream.
+    # If a user is 17 commits behind with no local-only commits, merge-base
+    # equals local HEAD and the URL is identical to what we shipped before;
+    # if they ARE ahead with local-only commits, the URL still resolves to
+    # the public history they share with upstream. If merge-base fails for
+    # any reason (e.g. shallow clone where the bases diverge before the
+    # cutoff), fall back to None so the JS link guard suppresses the link
+    # rather than emitting a known-broken URL.
+    mb_full, mb_ok = _run_git(['merge-base', 'HEAD', compare_ref], path)
+    if mb_ok and mb_full:
+        short, ok = _run_git(['rev-parse', '--short', mb_full], path)
+        current = short if (ok and short) else None
+    else:
+        current = None
     latest, _ = _run_git(['rev-parse', '--short', compare_ref], path)
+
+    # Get repo URL for "What's new?" link
+    remote_url, _ = _run_git(['remote', 'get-url', 'origin'], path)
+    remote_url = _normalize_remote_url(remote_url)
 
     return {
         'name': name,
@@ -156,7 +346,27 @@ def _check_repo(path, name):
         'current_sha': current,
         'latest_sha': latest,
         'branch': compare_ref,
+        'repo_url': remote_url,
+        'compare_url': _build_compare_url(remote_url, current, latest),
     }
+
+
+def _check_repo(path, name):
+    """Check if a git repo is behind its latest release. Returns dict or None."""
+    if path is None or not (path / '.git').exists():
+        return None
+
+    # Fetch tags first so update prompts track published releases, not every
+    # development commit that lands on master/main after the latest release.
+    _, fetch_ok = _run_git(['fetch', 'origin', '--quiet', '--tags'], path, timeout=15)
+    if not fetch_ok:
+        return {'name': name, 'behind': 0, 'error': 'fetch failed'}
+
+    release_info = _check_repo_release(path, name)
+    if release_info is not None:
+        return release_info
+
+    return _check_repo_branch(path, name, fetch=False)
 
 
 def check_for_updates(force=False):
@@ -181,6 +391,302 @@ def check_for_updates(force=False):
             return dict(_update_cache)
     finally:
         _check_in_progress = False
+
+
+def _repo_path_for_update_target(target: str):
+    if target == 'webui':
+        return REPO_ROOT
+    if target == 'agent':
+        return _AGENT_DIR
+    return None
+
+
+def _commit_subjects_for_update(info: dict, *, limit: int = 24) -> list[str]:
+    """Return commit subjects for an update range, if the local git refs exist."""
+    subjects, _truncated = _commit_subjects_for_update_with_limit(info, limit=limit)
+    return subjects
+
+
+def _commit_subjects_for_update_with_limit(info: dict, *, limit: int = 24) -> tuple[list[str], bool]:
+    """Return recent commit subjects plus whether the local list was capped."""
+    if not isinstance(info, dict):
+        return [], False
+    target = info.get('name')
+    if target not in ('webui', 'agent'):
+        target = 'webui' if info.get('repo_url', '').endswith('hermes-webui') else target
+    path = _repo_path_for_update_target(target)
+    if path is None or not (Path(path) / '.git').exists():
+        return [], False
+    current = str(info.get('current_sha') or '').strip()
+    latest = str(info.get('latest_sha') or '').strip()
+    if not (current and latest):
+        return [], False
+    probe_limit = max(1, int(limit)) + 1
+    out, ok = _run_git(['log', '--format=%s', f'{current}..{latest}', f'-n{probe_limit}'], path, timeout=5)
+    if not ok or not out:
+        return [], False
+    subjects = [line.strip() for line in out.splitlines() if line.strip()]
+    truncated = len(subjects) > limit
+    return subjects[:limit], truncated
+
+
+def _summary_cache_key(updates: dict, details: list[dict]) -> str:
+    """Stable key for the exact update range being summarized."""
+    payload = []
+    for item in details:
+        payload.append({
+            'name': item.get('name'),
+            'behind': item.get('behind'),
+            'current_sha': item.get('current_sha'),
+            'latest_sha': item.get('latest_sha'),
+            'compare_url': item.get('compare_url'),
+        })
+    blob = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()
+
+
+def _clean_summary_bullet(line: str) -> str:
+    line = re.sub(r'^\s*(?:[-*•]+|\d+[.)])\s*', '', str(line or '')).strip()
+    line = re.sub(r'\s+', ' ', line)
+    if not line:
+        return ''
+    if line[-1] not in '.!?':
+        line += '.'
+    return line[:240]
+
+
+def _split_summary_category(line: str) -> tuple[str | None, str]:
+    raw = str(line or '').strip()
+    match = re.match(r'^\s*(?:[-*•]+|\d+[.)])?\s*(notice|what you(?:ll|\'ll| will) notice|user(?:s)? will notice|worth knowing|worth|note)\s*:\s*(.+)$', raw, re.I)
+    if not match:
+        return None, raw
+    label = match.group(1).lower()
+    category = 'worth' if label in {'worth knowing', 'worth', 'note'} else 'notice'
+    return category, match.group(2)
+
+
+def _unique_summary_bullets(items: list[str]) -> list[str]:
+    seen = set()
+    bullets = []
+    for item in items:
+        cleaned = _clean_summary_bullet(item)
+        key = cleaned.lower()
+        if cleaned and key not in seen:
+            bullets.append(cleaned)
+            seen.add(key)
+    return bullets
+
+
+def _summary_bullets_from_text(text: str, *, fallback_items: list[str]) -> list[str]:
+    raw = str(text or '').strip()
+    candidates = []
+    for line in raw.splitlines():
+        _category, body = _split_summary_category(line)
+        cleaned = _clean_summary_bullet(body)
+        if cleaned:
+            candidates.append(cleaned)
+    if len(candidates) <= 1 and raw:
+        candidates = [_clean_summary_bullet(part) for part in re.split(r'(?<=[.!?])\s+', raw)]
+        candidates = [item for item in candidates if item]
+    if not candidates:
+        candidates = [_clean_summary_bullet(item) for item in fallback_items]
+    bullets = _unique_summary_bullets(candidates)
+    return bullets or ['Updates are available.']
+
+
+def _categorized_summary_bullets_from_text(text: str) -> tuple[list[str], list[str]]:
+    notice_items: list[str] = []
+    worth_items: list[str] = []
+    for line in str(text or '').splitlines():
+        category, body = _split_summary_category(line)
+        if category == 'notice':
+            notice_items.append(body)
+        elif category == 'worth':
+            worth_items.append(body)
+        elif re.match(r'^\s*(?:[-*•]+|\d+[.)])?\s*[A-Za-z][A-Za-z ]{1,32}\s*:', str(line or '')):
+            notice_items.append(body)
+    return _unique_summary_bullets(notice_items), _unique_summary_bullets(worth_items)
+
+
+def _fallback_update_bullets(details: list[dict]) -> list[str]:
+    bullets = []
+    for item in details:
+        label = item.get('label') or item.get('name') or 'Hermes'
+        behind = item.get('behind') or 0
+        commits = item.get('commits') or []
+        if commits:
+            highlights = '; '.join(commits[:3])
+            qualifier = 'recent updates' if item.get('commits_truncated') else 'updates'
+            bullets.append(f"{label} has {behind} update(s), including {qualifier}: {highlights}.")
+        else:
+            bullets.append(f"{label} has {behind} update(s) available.")
+    return bullets or ['Updates are available.']
+
+
+def _worth_knowing_bullets(details: list[dict]) -> list[str]:
+    items = []
+    truncated = [item for item in details if item.get('commits_truncated') and item.get('commits_limit')]
+    for item in truncated[:2]:
+        label = item.get('label') or item.get('name') or 'Hermes'
+        behind = item.get('behind') or 0
+        limit = item.get('commits_limit') or len(item.get('commits') or [])
+        items.append(
+            f"{label} has {behind} updates; this summary uses the latest {limit} commit subjects, with the full comparison still available in the diff link."
+        )
+    if items:
+        return items
+    targets = [
+        f"{item.get('label') or item.get('name') or 'Hermes'} ({item.get('behind') or 0} update{'s' if (item.get('behind') or 0) != 1 else ''})"
+        for item in details
+        if item.get('behind')
+    ]
+    if len(targets) > 1:
+        return ['This summary combines updates from ' + ' and '.join(targets) + '.']
+    return []
+
+
+def _format_update_summary_sections(summary_text: str, details: list[dict]) -> tuple[list[dict], str]:
+    notice_items, worth_items = _categorized_summary_bullets_from_text(summary_text)
+    if not notice_items:
+        notice_items = _summary_bullets_from_text(summary_text, fallback_items=_fallback_update_bullets(details))
+    notice_keys = {item.lower() for item in notice_items}
+    worth_items = [item for item in worth_items if item.lower() not in notice_keys]
+    worth_items.extend(
+        item for item in _worth_knowing_bullets(details)
+        if item.lower() not in notice_keys and item.lower() not in {existing.lower() for existing in worth_items}
+    )
+    sections = [
+        {
+            'title': "What you'll notice",
+            'items': notice_items,
+        },
+    ]
+    if worth_items:
+        sections.append(
+            {
+                'title': 'Worth knowing',
+                'items': worth_items,
+            }
+        )
+    lines = []
+    for section in sections:
+        lines.append(section['title'])
+        lines.extend(f"- {item}" for item in section['items'])
+        lines.append('')
+    return sections, '\n'.join(lines).strip()
+
+
+def _fallback_update_summary(updates: dict, details: list[dict]) -> str:
+    _sections, summary = _format_update_summary_sections('', details)
+    return summary
+
+
+def _update_summary_prompt(details: list[dict]) -> tuple[str, str]:
+    system = (
+        "You write human-readable release summaries for Hermes users. "
+        "Focus on what the user will notice in the product. Keep it simple, specific, and short. "
+        "avoid technical jargon, implementation details, SHA names, branch names, and file paths unless necessary. "
+        "Return only bullets. Do not include headings, markdown tables, intro paragraphs, or closing notes."
+    )
+    user_lines = [
+        "Summarize these available updates as concise bullets.",
+        "Prefix each bullet with `Notice:` for user-visible behavior changes or `Worth knowing:` for useful context.",
+        "Put user-visible Notice bullets first and include every meaningful user-facing change from the available commit subjects.",
+        "Use Worth knowing only for helpful context that is not a duplicate of a Notice bullet.",
+        "Use everyday language and explain visible behavior changes, not code mechanics.",
+        "Return only prefixed bullets; the WebUI will add the fixed section headings separately.",
+        "",
+    ]
+    for item in details:
+        user_lines.append(f"{item['label']}: {item['behind']} commit(s) behind")
+        commits = item.get('commits') or []
+        if commits:
+            if item.get('commits_truncated'):
+                user_lines.append(
+                    f"- Showing latest {len(commits)} of {item['behind']} commit subjects; summarize trends, not every commit."
+                )
+            user_lines.extend(f"- {subject}" for subject in commits)
+        else:
+            user_lines.append("- No local commit subjects available; summarize only the update count.")
+        user_lines.append("")
+    return system, '\n'.join(user_lines)
+
+
+def summarize_update_payload(updates: dict, llm_callback=None, *, target: str | None = None, use_cache: bool = True) -> dict:
+    """Build a human-readable What's New summary and keep regular diff comparison links.
+
+    ``llm_callback`` receives ``(system_prompt, user_prompt)`` and returns text.
+    The caller may wire that to AIAgent; this module keeps a deterministic
+    fallback so the banner remains useful when no LLM provider is configured.
+    Summaries are cached per exact update range so refreshes do not generate
+    slightly different wording for the same available updates.
+    """
+    if not isinstance(updates, dict):
+        updates = {}
+    requested_target = target if target in ('webui', 'agent') else None
+    details = []
+    for key, label in (('webui', 'WebUI'), ('agent', 'Agent')):
+        if requested_target and key != requested_target:
+            continue
+        info = updates.get(key)
+        if not isinstance(info, dict) or int(info.get('behind') or 0) <= 0:
+            continue
+        commit_limit = 24
+        commits, commits_truncated = _commit_subjects_for_update_with_limit({'name': key, **info}, limit=commit_limit)
+        behind = int(info.get('behind') or 0)
+        item = {
+            'name': key,
+            'label': label,
+            'behind': behind,
+            'current_sha': info.get('current_sha'),
+            'latest_sha': info.get('latest_sha'),
+            'compare_url': info.get('compare_url'),
+            'commits': commits,
+            'commits_limit': commit_limit,
+            'commits_truncated': bool(commits_truncated or (commits and behind > len(commits))),
+        }
+        details.append(item)
+    cache_key = _summary_cache_key(updates, details)
+    if use_cache:
+        with _cache_lock:
+            cached = _summary_cache.get(cache_key)
+            if cached:
+                _summary_cache.move_to_end(cache_key)
+        if cached:
+            result = dict(cached)
+            result['cached'] = True
+            return result
+
+    generated_by = 'fallback'
+    candidate = ''
+    if details and callable(llm_callback):
+        system, prompt = _update_summary_prompt(details)
+        try:
+            candidate = (llm_callback(system, prompt) or '').strip()
+            if candidate:
+                generated_by = 'llm'
+        except Exception:
+            candidate = ''
+    sections, summary = _format_update_summary_sections(candidate, details)
+    result = {
+        'ok': True,
+        'summary': summary,
+        'summary_sections': sections,
+        'generated_by': generated_by,
+        'cached': False,
+        'cache_key': cache_key,
+        'target': requested_target,
+        'targets': details,
+    }
+    if use_cache:
+        with _cache_lock:
+            if len(_summary_cache) >= _SUMMARY_CACHE_MAX and cache_key not in _summary_cache:
+                _summary_cache.popitem(last=False)
+            _summary_cache[cache_key] = dict(result)
+    return result
+
+
+# ── Self-update application ───────────────────────────────────────────────────
 
 
 def _schedule_restart(delay: float = 2.0) -> None:
@@ -240,6 +746,10 @@ def apply_force_update(target: str) -> dict:
     response with ``conflict: True`` or ``diverged: True`` and the user
     has confirmed they want to discard local changes.
     """
+    active_streams = _active_stream_count()
+    if active_streams:
+        return _restart_blocked_response(target, active_streams)
+
     if not _apply_lock.acquire(blocking=False):
         return {'ok': False, 'message': 'Update already in progress'}
     try:
@@ -290,6 +800,10 @@ def apply_force_update(target: str) -> dict:
 
 def apply_update(target):
     """Stash, pull --ff-only, pop for the given target repo."""
+    active_streams = _active_stream_count()
+    if active_streams:
+        return _restart_blocked_response(target, active_streams)
+
     if not _apply_lock.acquire(blocking=False):
         return {'ok': False, 'message': 'Update already in progress'}
     try:
