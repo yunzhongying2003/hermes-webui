@@ -113,6 +113,94 @@
       }catch(_){}
     })();
   </script>
+  <!-- Voice broadcast: TTS for message text -->
+  <script>
+    (function(){
+      const VOICE = 'zh-CN-XiaoxiaoNeural'; // 中文女声
+      let currentAudio = null;
+      
+      function speakText(text) {
+        // Stop current playback
+        if (currentAudio) {
+          currentAudio.pause();
+          currentAudio = null;
+        }
+        
+        // Clean text: remove markdown, code blocks, etc.
+        const cleanText = text
+          .replace(/```[\s\S]*?```/g, '')  // Remove code blocks
+          .replace(/`([^`]+)`/g, '$1')      // Remove inline code
+          .replace(/\*\*([^*]+)\*\*/g, '$1') // Remove bold
+          .replace(/\*([^*]+)\*/g, '$1')     // Remove italic
+          .replace(/~~([^~]+)~~/g, '$1')     // Remove strikethrough
+          .replace(/!\[([^\]]+)\]\([^)]+\)/g, '$1') // Remove images, keep alt
+          .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')   // Keep link text
+          .replace(/[#\-\+\>]/g, '')         // Remove markdown syntax
+          .trim();
+        
+        if (!cleanText) return;
+        
+        // Call TTS API
+        fetch('/api/tts', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({text: cleanText, voice: VOICE})
+        })
+        .then(res => res.json())
+        .then(data => {
+          if (data.url) {
+            currentAudio = new Audio(data.url);
+            currentAudio.play().catch(e => console.warn('[TTS] Play failed:', e));
+          }
+        })
+        .catch(e => console.error('[TTS] Error:', e));
+      }
+      
+      // Add voice button to each message
+      function addVoiceButtonToMessages() {
+        // User messages: .msg-row (has .msg-foot as direct child)
+        // Assistant messages: .assistant-turn (has .assistant-segment > .msg-foot as descendant)
+        const messages = document.querySelectorAll('.msg-row');
+        messages.forEach(msg => {
+          if (msg.querySelector('.btn-voice')) return; // Already added
+          
+          const btn = document.createElement('button');
+          btn.className = 'btn-voice';
+          btn.innerHTML = '🔊';
+          btn.title = '语音播报';
+          btn.onclick = () => {
+            const body = msg.querySelector('.msg-body') || msg.querySelector('.assistant-turn-blocks');
+            const textContent = body ? body.textContent : msg.textContent;
+            speakText(textContent);
+          };
+          
+          // Find .msg-actions:
+          // - For user messages: .msg-row > .msg-foot > .msg-actions (direct child)
+          // - For assistant messages: .assistant-turn .assistant-segment .msg-foot .msg-actions (descendant)
+          // Use descendant selector (remove >) to work for both
+          const msgActions = msg.querySelector('.msg-foot .msg-actions');
+          if (msgActions) {
+            msgActions.appendChild(btn);
+          } else {
+            // Fallback: append to end of message row
+            msg.appendChild(btn);
+          }
+        });
+      }
+      
+      // Run on load and observe DOM changes
+      addVoiceButtonToMessages();
+      // Use documentElement (<html>) as fallback - it exists even in <head> scripts
+      const targetEl = document.querySelector('.messages-inner') || document.documentElement;
+      const observer = new MutationObserver(addVoiceButtonToMessages);
+      observer.observe(targetEl, {
+        childList: true, subtree: true
+      });
+      
+      // Expose for manual trigger
+      window.speakText = speakText;
+    })();
+  </script>
 </head>
 <body>
 <header class="app-titlebar" role="banner">
@@ -1421,5 +1509,63 @@
     </div>
   </div>
 </div>
+<!-- Labubu Mascot -->
+<div id="labubu-mascot" title="Hermes Agent Status" onclick="showMascotStatus()">
+  <img id="labubu-img" src="static/mascot/labubu_sleep.gif" alt="Labubu" />
+  <span id="labubu-status" class="mascot-status idle"></span>
+</div>
+<div id="labubu-status-tooltip"></div>
+<script>
+  // === Labubu Mascot Status Monitor ===
+  (function() {
+    var mascotEl = document.getElementById('labubu-mascot');
+    var imgEl = document.getElementById('labubu-img');
+    var statusEl = document.getElementById('labubu-status');
+    var tooltipEl = document.getElementById('labubu-status-tooltip');
+    var checkInterval = 3000; // Check every 3 seconds
+    var currentStatus = 'idle';
+
+    function updateMascotStatus(data) {
+      if (!data || !mascotEl) return;
+      var activeStreams = data.active_streams || 0;
+      var idleSeconds = data.idle_seconds_since_last_run || 0;
+      var isBusy = activeStreams > 0;
+
+      var newStatus = isBusy ? 'busy' : 'idle';
+      if (newStatus !== currentStatus) {
+        currentStatus = newStatus;
+        if (isBusy) {
+          imgEl.src = 'static/mascot/labubu_work.gif';
+          statusEl.className = 'mascot-status busy';
+        } else {
+          imgEl.src = 'static/mascot/labubu_sleep.gif';
+          statusEl.className = 'mascot-status idle';
+        }
+      }
+    }
+
+    function checkAgentStatus() {
+      fetch('/health')
+        .then(function(r) { return r.json(); })
+        .then(function(data) { updateMascotStatus(data); })
+        .catch(function() {});
+    }
+
+    // Show status tooltip on click
+    window.showMascotStatus = function() {
+      var statusText = currentStatus === 'busy' ? '🔴 Agent 忙碌中' : '🟢 Agent 空闲';
+      tooltipEl.textContent = statusText;
+      tooltipEl.classList.add('visible');
+      setTimeout(function() {
+        tooltipEl.classList.remove('visible');
+      }, 2000);
+    };
+
+    // Initial check
+    checkAgentStatus();
+    // Periodic check
+    setInterval(checkAgentStatus, checkInterval);
+  })();
+</script>
 </body>
 </html>

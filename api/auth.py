@@ -51,6 +51,7 @@ PUBLIC_PATHS = frozenset({
     '/api/auth/login', '/api/auth/status',
     '/manifest.json', '/manifest.webmanifest',
     '/session/manifest.json', '/session/manifest.webmanifest',
+    '/api/audio/',  # TTS audio files - public access for playback
 })
 
 COOKIE_NAME = 'hermes_session'
@@ -429,6 +430,10 @@ def check_auth(handler, parsed) -> bool:
     # Public paths don't require auth
     if parsed.path in PUBLIC_PATHS or parsed.path.startswith('/static/') or parsed.path.startswith('/session/static/'):
         return True
+    # Check public path prefixes (e.g., /api/audio/xxx.mp3)
+    for prefix in ['/api/audio/']:
+        if parsed.path.startswith(prefix):
+            return True
     # Check session cookie
     cookie_val = parse_cookie(handler)
     if cookie_val and verify_session(cookie_val):

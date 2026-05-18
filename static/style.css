@@ -4170,3 +4170,90 @@ main.main.showing-logs > #mainLogs{display:flex;}
   text-align:left;
   unicode-bidi:isolate;
 }
+
+/* ── Voice broadcast button ───────────────────────────────────────────────── */
+.btn-voice {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  opacity: 0.6;
+  transition: opacity 0.2s;
+  color: inherit;
+}
+.btn-voice:hover {
+  opacity: 1;
+  background: var(--btn-hover-bg, rgba(255,255,255,0.05));
+}
+.btn-voice:active {
+  opacity: 0.8;
+}
+
+/* === Labubu Mascot === */
+#labubu-mascot {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  overflow: hidden;
+  z-index: 9999;
+  cursor: pointer;
+  transition: transform 0.2s ease;
+  background: var(--bg, #141425);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+}
+#labubu-mascot:hover {
+  transform: scale(1.1);
+}
+#labubu-mascot img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+#labubu-mascot .mascot-status {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--bg, #141425);
+  box-shadow: 0 0 4px rgba(0,0,0,0.5);
+}
+#labubu-mascot .mascot-status.busy {
+  background: #ff4444;
+  animation: mascot-pulse 1.5s ease-in-out infinite;
+}
+#labubu-mascot .mascot-status.idle {
+  background: #44cc44;
+}
+@keyframes mascot-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.6; transform: scale(1.2); }
+}
+/* Status tooltip */
+#labubu-status-tooltip {
+  position: fixed;
+  bottom: 100px;
+  right: 20px;
+  background: rgba(0,0,0,0.85);
+  color: #fff;
+  padding: 6px 14px;
+  border-radius: 8px;
+  font-size: 12px;
+  z-index: 10000;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s;
+  white-space: nowrap;
+}
+#labubu-status-tooltip.visible {
+  opacity: 1;
+}
